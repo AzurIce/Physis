@@ -1,246 +1,342 @@
 // SPDX-FileCopyrightText: 2024 Joshua Goins <josh@redstrate.com>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#![allow(unused)]
-
 use std::collections::HashMap;
-use std::io::{Cursor, SeekFrom};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use crate::common::Platform;
-use crate::common_file_operations::Half3;
+use crate::common_file_operations::{Half1, Half3};
 use crate::{ByteSpan, ReadableFile};
-use binrw::{BinRead, BinResult, Endian};
-use binrw::{BinReaderExt, binrw};
-use half::f16;
+use binrw::BinReaderExt;
 
-/// Maximum number of elements in one row
-// NOTE: this is probably wrong for other versions of the game?
-const MAX_ELEMENTS: usize = 254;
-
-#[binrw]
-#[brw(import(num_colors: usize, num_scalars: usize))]
-#[derive(Debug)]
-#[allow(dead_code)]
-struct StainingTemplateEntry {
-    #[br(map = calc_byte_counts, count = num_colors + num_scalars)]
-    byte_counts: Vec<u16>,
-
-    #[br(parse_with = read_color_array, args(&byte_counts, num_colors))]
-    #[bw(ignore)]
-    colors: Vec<Half3>,
-    #[br(parse_with = read_scalar_array, args(&byte_counts, num_colors, num_scalars))]
-    #[bw(ignore)]
-    scalars: Vec<u16>,
+/// A single STM entry containing dye color data for all dye indices.
+#[derive(Debug, Clone)]
+pub struct StmEntry {
+    pub diffuse: Vec<[f32; 3]>,
+    pub specular: Vec<[f32; 3]>,
+    pub emissive: Vec<[f32; 3]>,
+    pub gloss: Vec<f32>,
+    pub specular_power: Vec<f32>,
 }
 
-/// Legacy dye information.
-#[derive(Debug)]
-pub struct LegacyDye {
+impl StmEntry {
+    /// Get diffuse color for a given stain index (0-based, so stain_id - 1).
+    pub fn get_diffuse(&self, stain_index: usize) -> Option<[f32; 3]> {
+        self.diffuse.get(stain_index).copied()
+    }
+
+    /// Get specular color for a given stain index (0-based).
+    pub fn get_specular(&self, stain_index: usize) -> Option<[f32; 3]> {
+        self.specular.get(stain_index).copied()
+    }
+
+    /// Get emissive color for a given stain index (0-based).
+    pub fn get_emissive(&self, stain_index: usize) -> Option<[f32; 3]> {
+        self.emissive.get(stain_index).copied()
+    }
+
+    /// Get gloss value for a given stain index (0-based).
+    pub fn get_gloss(&self, stain_index: usize) -> Option<f32> {
+        self.gloss.get(stain_index).copied()
+    }
+
+    /// Get specular power value for a given stain index (0-based).
+    pub fn get_specular_power(&self, stain_index: usize) -> Option<f32> {
+        self.specular_power.get(stain_index).copied()
+    }
+}
+
+/// Dye pack with all color components for a single stain.
+#[derive(Debug, Clone)]
+pub struct DyePack {
     pub diffuse: [f32; 3],
     pub specular: [f32; 3],
     pub emissive: [f32; 3],
-    pub shininess: f32,
-    pub specular_mask: f32,
-}
-
-impl From<StainingTemplateEntry> for LegacyDye {
-    fn from(value: StainingTemplateEntry) -> Self {
-        Self {
-            diffuse: value.colors[0].into(),
-            specular: value.colors[1].into(),
-            emissive: value.colors[2].into(),
-            shininess: f16::from_bits(value.scalars[0]).to_f32_const(),
-            specular_mask: f16::from_bits(value.scalars[1]).to_f32_const(),
-        }
-    }
-}
-
-/// Dawntrail-era dye information.
-#[derive(Debug)]
-pub struct Dye {
-    pub diffuse: [f32; 3],
-    pub specular: [f32; 3],
-    pub emissive: [f32; 3],
-    scalar3: f32, // TODO: what is this?
-    pub metalness: f32,
-    pub roughness: f32,
-    pub sheen_rate: f32,
-    pub sheen_tint_rate: f32,
-    pub sheen_aperture: f32,
-    pub anisotropy: f32,
-    pub raw_sphere_map_index: u16,
-    pub sphere_map_mask: f32,
-}
-
-impl From<StainingTemplateEntry> for Dye {
-    fn from(value: StainingTemplateEntry) -> Self {
-        Self {
-            diffuse: value.colors[0].into(),
-            specular: value.colors[1].into(),
-            emissive: value.colors[2].into(),
-            scalar3: f16::from_bits(value.scalars[9]).to_f32_const(),
-            metalness: f16::from_bits(value.scalars[1]).to_f32_const(),
-            roughness: f16::from_bits(value.scalars[2]).to_f32_const(),
-            sheen_rate: f16::from_bits(value.scalars[3]).to_f32_const(),
-            sheen_tint_rate: f16::from_bits(value.scalars[4]).to_f32_const(),
-            sheen_aperture: f16::from_bits(value.scalars[5]).to_f32_const(),
-            anisotropy: f16::from_bits(value.scalars[6]).to_f32_const(),
-            raw_sphere_map_index: value.scalars[7],
-            sphere_map_mask: f16::from_bits(value.scalars[8]).to_f32_const(),
-        }
-    }
-}
-
-fn calc_byte_counts(ends: Vec<u16>) -> Vec<u16> {
-    let mut last_end = 0;
-    let mut byte_counts = Vec::new();
-    for end in ends {
-        let next_end = end * 2;
-        byte_counts.push(next_end.wrapping_sub(last_end));
-        last_end = next_end;
-    }
-
-    byte_counts
-}
-
-#[binrw::parser(reader, endian)]
-fn read_color_array(byte_counts: &[u16], num_colors: usize) -> BinResult<Vec<Half3>> {
-    let mut entries = Vec::with_capacity(num_colors);
-
-    for count in byte_counts.iter().take(num_colors) {
-        let mut array: Vec<Half3> = read_array(reader, endian, *count);
-        entries.append(&mut array); // TODO: wrong
-    }
-
-    Ok(entries)
-}
-
-#[binrw::parser(reader, endian)]
-fn read_scalar_array(
-    byte_counts: &[u16],
-    num_colors: usize,
-    num_scalars: usize,
-) -> BinResult<Vec<u16>> {
-    let mut entries = Vec::with_capacity(num_scalars);
-
-    for count in byte_counts.iter().skip(num_colors).take(num_scalars) {
-        let mut array: Vec<u16> = read_array(reader, endian, *count);
-        entries.append(&mut array); // TODO: wrong
-    }
-
-    Ok(entries)
-}
-
-fn read_array<
-    T: binrw::BinRead<Args<'static> = ()> + Default + Clone + Copy,
-    R: std::io::Read + BinReaderExt,
->(
-    cursor: &mut R,
-    endian: Endian,
-    size: u16,
-) -> Vec<T> {
-    let array_size = size as usize / std::mem::size_of::<T>();
-    if array_size == 0 {
-        vec![T::default(); MAX_ELEMENTS]
-    } else if array_size == 1 {
-        let element = cursor.read_type::<T>(endian).unwrap();
-        vec![element; MAX_ELEMENTS]
-    } else if array_size < MAX_ELEMENTS {
-        let real_count = (size as usize - MAX_ELEMENTS) / std::mem::size_of::<T>();
-        let mut values = vec![];
-        let mut indices = vec![];
-        values.push(T::default());
-        for _ in 0..real_count {
-            values.push(cursor.read_type::<T>(endian).unwrap());
-        }
-
-        let eof_marker = cursor.read_type::<u8>(endian).unwrap();
-        assert_eq!(eof_marker, 0xFF); // TDOO: restore
-
-        for _ in 0..MAX_ELEMENTS - 1 {
-            indices.push(cursor.read_type::<u8>(endian).unwrap());
-        }
-
-        let mut vec = vec![];
-        for index in indices {
-            if (index as usize) < values.len() {
-                vec.push(values[index as usize]);
-            } else {
-                vec.push(T::default());
-            }
-        }
-
-        vec
-    } else if array_size == MAX_ELEMENTS {
-        let mut vec = vec![];
-        for _ in 0..size {
-            vec.push(cursor.read_type::<T>(endian).unwrap());
-        }
-        vec
-    } else {
-        panic!("Too many elements");
-    }
+    pub gloss: f32,
+    pub specular_power: f32,
 }
 
 /// Staining template material file, usually with the `.stm` file extension.
 ///
-/// Contains dye information.
-#[binrw]
+/// Contains dye color information indexed by template ID and stain index.
+/// Supports both old format (u16 keys, 128 dyes) and new format (u32 keys, 254 dyes).
 #[derive(Debug)]
-#[brw(magic = 0x534Du16)]
-pub struct Stm {
-    version: u16,
-    entry_count: u16,
-    unk1: u16,
-
-    // NOTE: older versions i think is u16?
-    #[br(count = entry_count)]
-    keys: Vec<u32>,
-
-    #[br(count = entry_count)]
-    offsets: Vec<u32>,
-
-    #[br(calc = 3)]
-    #[bw(ignore)]
-    num_colors: usize,
-    #[br(calc = if version == 0x101 { 2 } else { 9 } )]
-    #[bw(ignore)]
-    num_scalars: usize,
-
-    #[br(if(version != 0x101), parse_with = read_entries, args(&keys, &offsets, num_colors, num_scalars))]
-    #[bw(ignore)] // TODO: support writing
-    pub dyes: HashMap<u32, Dye>,
-
-    #[br(if(version == 0x101), parse_with = read_entries, args(&keys, &offsets, num_colors, num_scalars))]
-    #[bw(ignore)] // TODO: support writing
-    pub legacy_dyes: HashMap<u32, LegacyDye>,
+pub struct StainingTemplate {
+    pub entries: HashMap<u16, StmEntry>,
 }
 
-#[binrw::parser(reader, endian)]
-fn read_entries<T: From<StainingTemplateEntry>>(
-    keys: &[u32],
-    offsets: &[u32],
-    num_colors: usize,
-    num_scalars: usize,
-) -> BinResult<HashMap<u32, T>> {
-    let mut entries = HashMap::with_capacity(keys.len());
-
-    let start_position = reader.stream_position().unwrap();
-
-    for (key, offset) in keys.iter().zip(offsets) {
-        reader.seek(SeekFrom::Start(start_position + *offset as u64 * 2))?;
-        let entry: StainingTemplateEntry =
-            reader.read_type_args(endian, (num_colors, num_scalars))?;
-        entries.insert(*key, T::from(entry));
+impl StainingTemplate {
+    /// Look up a complete DyePack for a given template ID and stain index (0-based).
+    ///
+    /// Handles Dawntrail template ID mapping: IDs >= 1000 are mapped to (id - 1000)
+    /// in the legacy STM file.
+    pub fn get_dye_pack(&self, template_id: u16, stain_index: usize) -> Option<DyePack> {
+        // Dawntrail templates (>= 1000) map to legacy templates by stripping the prefix
+        let key = if template_id >= 1000 {
+            template_id - 1000
+        } else {
+            template_id
+        };
+        let entry = self.entries.get(&key)?;
+        Some(DyePack {
+            diffuse: entry.get_diffuse(stain_index).unwrap_or([1.0, 1.0, 1.0]),
+            specular: entry.get_specular(stain_index).unwrap_or([1.0, 1.0, 1.0]),
+            emissive: entry.get_emissive(stain_index).unwrap_or([0.0, 0.0, 0.0]),
+            gloss: entry.get_gloss(stain_index).unwrap_or(0.0),
+            specular_power: entry.get_specular_power(stain_index).unwrap_or(0.0),
+        })
     }
 
-    Ok(entries)
+    /// Read an array of Half3 values and convert to Vec<[f32; 3]>.
+    fn read_half3_array(
+        cursor: &mut Cursor<ByteSpan>,
+        offset: u64,
+        size: usize,
+        num_dyes: usize,
+    ) -> Vec<[f32; 3]> {
+        let raw: Vec<Half3> = Self::read_array::<Half3>(cursor, offset, size, num_dyes);
+        raw.iter()
+            .map(|h| [h.r.to_f32(), h.g.to_f32(), h.b.to_f32()])
+            .collect()
+    }
+
+    /// Read an array of Half1 values and convert to Vec<f32>.
+    fn read_half1_array(
+        cursor: &mut Cursor<ByteSpan>,
+        offset: u64,
+        size: usize,
+        num_dyes: usize,
+    ) -> Vec<f32> {
+        let raw: Vec<Half1> = Self::read_array::<Half1>(cursor, offset, size, num_dyes);
+        raw.iter().map(|h| h.value.to_f32()).collect()
+    }
+
+    /// Read a sub-table, detecting the encoding mode:
+    ///
+    /// - **Singleton** (array_size == 1): single value replicated for all dyes
+    /// - **OneToOne** (array_size >= num_dyes): direct values, one per dye
+    /// - **Indexed** (1 < array_size < num_dyes): palette + marker byte + index table
+    ///   - palette_count = (size - num_dyes) / sizeof(T)
+    ///   - First byte of index section is a marker (0xFF), skipped
+    ///   - Indices are 1-based: 0 or 255 → default, else → palette[index - 1]
+    ///   - Last dye entry is forced to default
+    fn read_array<T: binrw::BinRead<Args<'static> = ()> + Default + Clone + Copy>(
+        cursor: &mut Cursor<ByteSpan>,
+        offset: u64,
+        size: usize,
+        num_dyes: usize,
+    ) -> Vec<T> {
+        let elem_size = std::mem::size_of::<T>();
+        if elem_size == 0 || size == 0 {
+            return vec![T::default(); num_dyes];
+        }
+
+        let array_size = size / elem_size;
+
+        if array_size == 0 {
+            return vec![T::default(); num_dyes];
+        }
+
+        cursor.seek(SeekFrom::Start(offset)).unwrap();
+
+        if array_size == 1 {
+            // Singleton: replicate single value for all dyes
+            let element = cursor.read_le::<T>().unwrap();
+            return vec![element; num_dyes];
+        }
+
+        if array_size >= num_dyes {
+            // OneToOne: read num_dyes values directly
+            let mut result = Vec::with_capacity(num_dyes);
+            for _ in 0..num_dyes {
+                result.push(cursor.read_le::<T>().unwrap());
+            }
+            return result;
+        }
+
+        // Indexed: palette + marker byte + (num_dyes - 1) index bytes
+        // palette_count = (size - num_dyes) / elem_size
+        if size < num_dyes {
+            return vec![T::default(); num_dyes];
+        }
+        let palette_count = (size - num_dyes) / elem_size;
+        if palette_count == 0 {
+            return vec![T::default(); num_dyes];
+        }
+
+        // Read palette values
+        let mut palette: Vec<T> = Vec::with_capacity(palette_count);
+        for _ in 0..palette_count {
+            palette.push(cursor.read_le::<T>().unwrap());
+        }
+
+        // Read index section (num_dyes bytes: 1 marker + (num_dyes - 1) actual indices)
+        let mut index_bytes = vec![0u8; num_dyes];
+        cursor.read_exact(&mut index_bytes).unwrap_or(());
+
+        // Build result: skip byte 0 (marker), read bytes 1..(num_dyes-1), last entry = default
+        let mut result = Vec::with_capacity(num_dyes);
+        for i in 0..num_dyes {
+            if i == num_dyes - 1 {
+                // Last dye entry is forced to default
+                result.push(T::default());
+            } else {
+                // Index bytes are at positions 1..(num_dyes-1), so read index_bytes[i + 1]
+                let index = index_bytes[i + 1] as usize;
+                if index == 0 || index == 255 {
+                    result.push(T::default());
+                } else if index - 1 < palette.len() {
+                    result.push(palette[index - 1]);
+                } else {
+                    result.push(T::default());
+                }
+            }
+        }
+        result
+    }
 }
 
-impl ReadableFile for Stm {
-    fn from_existing(platform: Platform, buffer: ByteSpan) -> Option<Self> {
+impl ReadableFile for StainingTemplate {
+    fn from_existing(_platform: Platform, buffer: ByteSpan) -> Option<Self> {
+        if buffer.len() < 8 {
+            return None;
+        }
+
         let mut cursor = Cursor::new(buffer);
-        Stm::read_options(&mut cursor, platform.endianness(), ()).ok()
+
+        // Header: 4 × u16
+        let _magic: u16 = cursor.read_le().ok()?;
+        let version: u16 = cursor.read_le().ok()?;
+        let entry_count: u16 = cursor.read_le().ok()?;
+        let _unknown: u16 = cursor.read_le().ok()?;
+
+        if entry_count == 0 {
+            return Some(StainingTemplate {
+                entries: HashMap::new(),
+            });
+        }
+
+        let n = entry_count as usize;
+
+        // Detect old vs new format (matching TexTools heuristic)
+        // Old format: u16 keys/offsets, 128 dyes
+        // New format: u32 keys/offsets, 254 dyes
+        let old_format = if buffer.len() > 0x0B {
+            // For Endwalker STM: if the 3rd/4th bytes of the first key entry are non-zero,
+            // the keys are u16 (old format). If zero, they're u32 (new format).
+            buffer[0x0A] != 0x00 || buffer[0x0B] != 0x00
+        } else {
+            version < 0x0101
+        };
+
+        let num_dyes: usize = if old_format { 128 } else { 254 };
+
+        // Read keys and offsets
+        let mut keys = Vec::with_capacity(n);
+        let mut offsets = Vec::with_capacity(n);
+
+        if old_format {
+            for _ in 0..n {
+                keys.push(cursor.read_le::<u16>().ok()? as u32);
+            }
+            for _ in 0..n {
+                offsets.push(cursor.read_le::<u16>().ok()? as u32);
+            }
+        } else {
+            for _ in 0..n {
+                keys.push(cursor.read_le::<u32>().ok()?);
+            }
+            for _ in 0..n {
+                offsets.push(cursor.read_le::<u32>().ok()?);
+            }
+        }
+
+        // data_base = end of header
+        let header_entry_size: usize = if old_format { 4 } else { 8 }; // per entry: key + offset
+        let end_of_header = 8 + header_entry_size * n;
+
+        let mut entries = HashMap::new();
+
+        for i in 0..n {
+            let key = keys[i] as u16;
+            let entry_start = offsets[i] as usize * 2 + end_of_header;
+
+            if entry_start + 10 > buffer.len() {
+                continue;
+            }
+
+            cursor.seek(SeekFrom::Start(entry_start as u64)).ok()?;
+
+            // Read 5 sub-table end offsets (cumulative, in half-word units)
+            // Multiply by 2 to get byte offsets
+            let mut ends = [0u16; 5];
+            for end in &mut ends {
+                *end = cursor.read_le::<u16>().ok()?;
+            }
+
+            let data_start = entry_start + 10; // 5 × u16 = 10 bytes
+
+            // Compute sub-table byte ranges from cumulative ends
+            // ends[i] is in half-word units; multiply by 2 for bytes
+            let sub_ranges: [(usize, usize); 5] = {
+                let e0 = ends[0] as usize * 2;
+                let e1 = ends[1] as usize * 2;
+                let e2 = ends[2] as usize * 2;
+                let e3 = ends[3] as usize * 2;
+                let e4 = ends[4] as usize * 2;
+                [
+                    (0, e0),           // diffuse
+                    (e0, e1 - e0),     // specular
+                    (e1, e2 - e1),     // emissive
+                    (e2, e3 - e2),     // gloss
+                    (e3, e4 - e3),     // specular_power
+                ]
+            };
+
+            let diffuse = Self::read_half3_array(
+                &mut cursor,
+                (data_start + sub_ranges[0].0) as u64,
+                sub_ranges[0].1,
+                num_dyes,
+            );
+            let specular = Self::read_half3_array(
+                &mut cursor,
+                (data_start + sub_ranges[1].0) as u64,
+                sub_ranges[1].1,
+                num_dyes,
+            );
+            let emissive = Self::read_half3_array(
+                &mut cursor,
+                (data_start + sub_ranges[2].0) as u64,
+                sub_ranges[2].1,
+                num_dyes,
+            );
+            let gloss = Self::read_half1_array(
+                &mut cursor,
+                (data_start + sub_ranges[3].0) as u64,
+                sub_ranges[3].1,
+                num_dyes,
+            );
+            let specular_power = Self::read_half1_array(
+                &mut cursor,
+                (data_start + sub_ranges[4].0) as u64,
+                sub_ranges[4].1,
+                num_dyes,
+            );
+
+            entries.insert(
+                key,
+                StmEntry {
+                    diffuse,
+                    specular,
+                    emissive,
+                    gloss,
+                    specular_power,
+                },
+            );
+        }
+
+        Some(StainingTemplate { entries })
     }
 }
 
@@ -252,6 +348,6 @@ mod tests {
 
     #[test]
     fn test_invalid() {
-        pass_random_invalid::<Stm>();
+        pass_random_invalid::<StainingTemplate>();
     }
 }
